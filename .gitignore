@@ -1,0 +1,5 @@
+links-*.txt
+*.bak
+deploy.log
+dev
+.idea
