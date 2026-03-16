@@ -9,9 +9,10 @@
 #   2. Generates fresh Reality keys
 #   3. Configures Xray with all users from config.env
 #   4. Sets up systemd, logrotate, DNS
-#   5. Updates iptables on THIS (relay) server
-#   6. Runs a full chain test
-#   7. Outputs new VLESS links for all users
+#   5. Installs Cloudflare WARP for AI service unblocking (if enabled)
+#   6. Updates iptables on THIS (relay) server
+#   7. Runs a full chain test
+#   8. Outputs new VLESS links for all users
 #
 # Safe to run via nohup: ./deploy.sh IP PASS > deploy.log 2>&1 &
 
@@ -47,7 +48,7 @@ fi
 
 EXIT_IP="$1"
 EXIT_PASS="$2"
-TOTAL_STEPS=10
+TOTAL_STEPS=11
 
 [ -f "$CONFIG_FILE" ] || fail "Config not found: $CONFIG_FILE"
 source "$CONFIG_FILE"
@@ -188,6 +189,38 @@ for entry in "${UUIDS[@]}"; do
             {\"flow\": \"xtls-rprx-vision\", \"id\": \"$uuid\"}"
 done
 
+WARP_OUTBOUND=""
+WARP_ROUTING=""
+if [ "${WARP_ENABLED:-false}" = "true" ]; then
+    WARP_OUTBOUND=',
+        {
+            "protocol": "socks",
+            "settings": {
+                "servers": [{"address": "127.0.0.1", "port": '"$WARP_PORT"'}]
+            },
+            "tag": "warp"
+        }'
+
+    DOMAINS_JSON=""
+    for d in "${WARP_DOMAINS[@]}"; do
+        [ -n "$DOMAINS_JSON" ] && DOMAINS_JSON="$DOMAINS_JSON,"
+        DOMAINS_JSON="$DOMAINS_JSON
+                    \"$d\""
+    done
+    WARP_ROUTING=',
+    "routing": {
+        "domainStrategy": "AsIs",
+        "rules": [
+            {
+                "type": "field",
+                "domain": ['"$DOMAINS_JSON"'
+                ],
+                "outboundTag": "warp"
+            }
+        ]
+    }'
+fi
+
 cat > "$TMP_DIR/config.json" << XRAY_EOF
 {
     "log": {
@@ -236,8 +269,8 @@ cat > "$TMP_DIR/config.json" << XRAY_EOF
             "protocol": "freedom",
             "settings": {"domainStrategy": "UseIP"},
             "tag": "direct"
-        }
-    ]
+        }$WARP_OUTBOUND
+    ]$WARP_ROUTING
 }
 XRAY_EOF
 
@@ -311,9 +344,47 @@ ssh_exit "sed -i 's/^#\\?FallbackDNS=.*/FallbackDNS=8.8.8.8 1.1.1.1 8.8.4.4/' /e
 log "Logrotate and DNS configured"
 
 # ---------------------------------------------------------------------------
-# Step 8: Copy SSH key to exit server
+# Step 8: Install Cloudflare WARP (SOCKS5 proxy for AI services)
 # ---------------------------------------------------------------------------
-step 8 "Setting up SSH key access to exit server"
+if [ "${WARP_ENABLED:-false}" = "true" ]; then
+    step 8 "Installing Cloudflare WARP on exit server"
+
+    WARP_INSTALLED=$(ssh_exit "dpkg -l cloudflare-warp 2>/dev/null | grep -c '^ii'" || echo 0)
+
+    if [ "$WARP_INSTALLED" -lt 1 ]; then
+        ssh_exit "export DEBIAN_FRONTEND=noninteractive; curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg; CODENAME=\$(lsb_release -cs); echo \"deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ \$CODENAME main\" > /etc/apt/sources.list.d/cloudflare-client.list; apt-get update -qq > /dev/null 2>&1; apt-get install -y -qq cloudflare-warp > /dev/null 2>&1"
+        sleep 3
+        log "WARP package installed"
+    else
+        log "WARP already installed"
+    fi
+
+    WARP_REG=$(ssh_exit "warp-cli --accept-tos status 2>&1" || true)
+    if echo "$WARP_REG" | grep -q "Registration Missing"; then
+        ssh_exit "warp-cli --accept-tos registration new 2>&1"
+        log "WARP registered"
+    else
+        log "WARP already registered"
+    fi
+
+    ssh_exit "warp-cli --accept-tos mode proxy 2>&1; warp-cli --accept-tos proxy port $WARP_PORT 2>&1; warp-cli --accept-tos connect 2>&1" > /dev/null
+    sleep 5
+
+    WARP_STATUS=$(ssh_exit "warp-cli --accept-tos status 2>&1")
+    if echo "$WARP_STATUS" | grep -q "Connected"; then
+        WARP_IP=$(ssh_exit "curl -x socks5h://127.0.0.1:$WARP_PORT -s --connect-timeout 10 https://ifconfig.me 2>/dev/null" || echo "unknown")
+        log "WARP connected (exit IP: $WARP_IP)"
+    else
+        warn "WARP not connected — AI services will use direct exit. Status: $WARP_STATUS"
+    fi
+else
+    step 8 "Skipping WARP (disabled in config.env)"
+fi
+
+# ---------------------------------------------------------------------------
+# Step 9: Copy SSH key to exit server
+# ---------------------------------------------------------------------------
+step 9 "Setting up SSH key access to exit server"
 
 PUB_KEY=""
 for kf in /root/.ssh/id_ed25519.pub /root/.ssh/id_rsa.pub; do
@@ -334,9 +405,9 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Step 9: Update relay iptables
+# Step 10: Update relay iptables
 # ---------------------------------------------------------------------------
-step 9 "Updating relay iptables (this server)"
+step 10 "Updating relay iptables (this server)"
 
 OLD_EXIT_IP=$(grep '^LATVIA_IP=' "$CHAIN_SCRIPT" | head -1 | cut -d'"' -f2)
 
@@ -367,9 +438,9 @@ FWD_OK=$(iptables -L FORWARD -n | grep -c "$EXIT_IP" || true)
 log "iptables updated and saved (DNAT: $DNAT_OK rules, FORWARD: $FWD_OK rules)"
 
 # ---------------------------------------------------------------------------
-# Step 10: Full chain test
+# Step 11: Full chain test
 # ---------------------------------------------------------------------------
-step 10 "Testing full VPN chain"
+step 11 "Testing full VPN chain"
 
 TCP_OK="FAIL"
 if bash -c "exec 3<>/dev/tcp/$EXIT_IP/$XRAY_PORT" 2>/dev/null; then
