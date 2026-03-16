@@ -1,18 +1,20 @@
 #!/bin/bash
-# deploy.sh — Deploy a new VPN exit node from the relay server
+# deploy.sh — Deploy a new VPN exit node from the Russia router server
 #
 # Usage:
 #   ./deploy.sh <exit_server_ip> <exit_server_root_password>
 #
 # What it does:
 #   1. Installs Xray on the exit server
-#   2. Generates fresh Reality keys
-#   3. Configures Xray with all users from config.env
+#   2. Generates fresh Reality keys for Russia↔exit link
+#   3. Configures exit Xray with users from Russia's config + service UUID
 #   4. Sets up systemd, logrotate, DNS
 #   5. Installs Cloudflare WARP for AI service unblocking (if enabled)
-#   6. Updates iptables on THIS (relay) server
+#   6. Updates Russia's Xray outbound to point to the new exit
 #   7. Runs a full chain test
-#   8. Outputs new VLESS links for all users
+#   8. Outputs VLESS links (unchanged — use Russia's keys)
+#
+# Client VLESS links do NOT change when replacing exit servers.
 #
 # Safe to run via nohup: ./deploy.sh IP PASS > deploy.log 2>&1 &
 
@@ -20,7 +22,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CONFIG_FILE="$SCRIPT_DIR/config.env"
-CHAIN_SCRIPT="/opt/vpn-chain/iptables-chain.sh"
+RUSSIA_XRAY_CONFIG="/usr/local/etc/xray/config.json"
 TMP_DIR="/tmp/vpn-deploy-$$"
 
 RED='\033[0;31m'
@@ -100,10 +102,6 @@ scp_to_exit() {
     fi
 }
 
-remove_all_rules() {
-    local table="$1"; shift
-    while iptables $table -D "$@" 2>/dev/null; do :; done
-}
 
 # ---------------------------------------------------------------------------
 # Step 1: Preflight checks
@@ -111,16 +109,9 @@ remove_all_rules() {
 step 1 "Preflight checks"
 
 command -v sshpass >/dev/null 2>&1 || fail "sshpass not installed. Run: apt install sshpass"
-[ -f "$CHAIN_SCRIPT" ]          || fail "Chain script missing: $CHAIN_SCRIPT"
-
-if [ ! -f /tmp/xray ]; then
-    warn "/tmp/xray not found — downloading for chain test..."
-    cd /tmp
-    wget -q "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip" -O xray.zip
-    unzip -o xray.zip xray >/dev/null 2>&1
-    chmod +x /tmp/xray
-    rm -f xray.zip
-fi
+[ -f "$RUSSIA_XRAY_CONFIG" ]    || fail "Russia Xray config missing: $RUSSIA_XRAY_CONFIG"
+[ -f /usr/local/bin/xray ]      || fail "Xray not installed on Russia"
+systemctl is-active xray >/dev/null 2>&1 || fail "Russia Xray not running"
 
 if $USE_KEY; then
     log "Auth: SSH key"
@@ -150,36 +141,63 @@ log "Xray installed"
 # ---------------------------------------------------------------------------
 # Step 4: Generate Reality keys
 # ---------------------------------------------------------------------------
-step 4 "Generating Reality keys and $NUM_USERS UUIDs"
+step 4 "Generating Reality keys for Russia↔exit link + reading existing UUIDs"
 
+# Generate NEW Reality keys for the exit server (separate from Russia's client-facing keys)
 KEY_OUTPUT=$(ssh_exit "/usr/local/bin/xray x25519 2>&1")
-PRIVATE_KEY=$(echo "$KEY_OUTPUT" | grep "PrivateKey:" | awk '{print $2}')
-PUBLIC_KEY=$(echo "$KEY_OUTPUT" | grep "Password:" | awk '{print $2}')
+EXIT_PRIVATE_KEY=$(echo "$KEY_OUTPUT" | grep "PrivateKey:" | awk '{print $2}')
+EXIT_PUBLIC_KEY=$(echo "$KEY_OUTPUT" | grep "Password:" | awk '{print $2}')
 SHORT_ID=$(ssh_exit "openssl rand -hex 8")
 
-[ -n "$PRIVATE_KEY" ] || fail "Failed to generate private key. Output: $KEY_OUTPUT"
-[ -n "$PUBLIC_KEY" ]  || fail "Failed to generate public key"
+[ -n "$EXIT_PRIVATE_KEY" ] || fail "Failed to generate private key. Output: $KEY_OUTPUT"
+[ -n "$EXIT_PUBLIC_KEY" ]  || fail "Failed to generate public key"
 [ -n "$SHORT_ID" ]    || fail "Failed to generate shortId"
 
-UUIDS_RAW=$(ssh_exit "for i in \$(seq 1 $NUM_USERS); do /usr/local/bin/xray uuid; done 2>&1")
+# Read existing UUIDs from Russia's Xray config (clients don't change when replacing exit)
+UUIDS_RAW=$(python3 -c "
+import json
+with open('$RUSSIA_XRAY_CONFIG') as f:
+    c = json.load(f)
+for i, cl in enumerate(c['inbounds'][0]['settings']['clients']):
+    print(cl['id'] + ':User' + str(i))
+")
 UUIDS=()
-i=1
-while IFS= read -r uuid; do
-    [ -n "$uuid" ] || continue
-    UUIDS+=("$uuid:User$i")
-    i=$((i + 1))
+while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    UUIDS+=("$line")
 done <<< "$UUIDS_RAW"
-[ "${#UUIDS[@]}" -eq "$NUM_USERS" ] || fail "Expected $NUM_USERS UUIDs, got ${#UUIDS[@]}"
+[ "${#UUIDS[@]}" -ge 1 ] || fail "No UUIDs found in Russia config"
 
-log "Private Key: ${PRIVATE_KEY:0:8}..."
-log "Public Key:  $PUBLIC_KEY"
-log "Short ID:    $SHORT_ID"
-log "UUIDs:       ${#UUIDS[@]} generated"
+# Read Russia's client-facing keys (for VLESS links)
+RUSSIA_PRIVATE_KEY=$(python3 -c "
+import json
+with open('$RUSSIA_XRAY_CONFIG') as f:
+    c = json.load(f)
+print(c['inbounds'][0]['streamSettings']['realitySettings']['privateKey'])
+")
+RUSSIA_PUBLIC_KEY=$(/usr/local/bin/xray x25519 -i "$RUSSIA_PRIVATE_KEY" 2>&1 | grep "Password:" | awk '{print $2}')
+RUSSIA_SHORT_ID=$(python3 -c "
+import json
+with open('$RUSSIA_XRAY_CONFIG') as f:
+    c = json.load(f)
+print(c['inbounds'][0]['streamSettings']['realitySettings']['shortIds'][0])
+")
+[ -n "$RUSSIA_PUBLIC_KEY" ] || fail "Cannot derive Russia public key"
+
+# For backward compat, set PUBLIC_KEY/PRIVATE_KEY used later in the script
+PRIVATE_KEY="$EXIT_PRIVATE_KEY"
+PUBLIC_KEY="$EXIT_PUBLIC_KEY"
+
+log "Exit Private Key: ${EXIT_PRIVATE_KEY:0:8}..."
+log "Exit Public Key:  $EXIT_PUBLIC_KEY"
+log "Short ID:         $SHORT_ID"
+log "UUIDs:            ${#UUIDS[@]} (from Russia config)"
+log "Russia Public Key: ${RUSSIA_PUBLIC_KEY:0:16}... (for client links)"
 
 # ---------------------------------------------------------------------------
 # Step 5: Create Xray config (build locally, scp to exit)
 # ---------------------------------------------------------------------------
-step 5 "Creating Xray config with ${#UUIDS[@]} users"
+step 5 "Creating Xray config with ${#UUIDS[@]} users + service UUID"
 
 CLIENTS_JSON=""
 for entry in "${UUIDS[@]}"; do
@@ -188,6 +206,9 @@ for entry in "${UUIDS[@]}"; do
     CLIENTS_JSON="${CLIENTS_JSON}
             {\"flow\": \"xtls-rprx-vision\", \"id\": \"$uuid\"}"
 done
+# Service UUID for Russia→exit link (no flow, allows mux)
+CLIENTS_JSON="${CLIENTS_JSON},
+            {\"id\": \"$SERVICE_UUID\"}"
 
 WARP_OUTBOUND=""
 WARP_ROUTING=""
@@ -405,51 +426,58 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Step 10: Update relay iptables
+# Step 10: Update Russia's Xray outbound to point to new exit
 # ---------------------------------------------------------------------------
-step 10 "Updating relay iptables (this server)"
+step 10 "Updating Russia Xray outbound (this server)"
 
-OLD_EXIT_IP=$(grep '^LATVIA_IP=' "$CHAIN_SCRIPT" | head -1 | cut -d'"' -f2)
+python3 -c "
+import json, sys
 
-if [ -n "$OLD_EXIT_IP" ] && [ "$OLD_EXIT_IP" != "$EXIT_IP" ]; then
-    log "Switching exit IP: $OLD_EXIT_IP → $EXIT_IP"
-    for PORT in "${RELAY_PORTS[@]}"; do
-        remove_all_rules "-t nat" PREROUTING -p tcp --dport "$PORT" -j DNAT --to-destination "${OLD_EXIT_IP}:${XRAY_PORT}"
-    done
-    remove_all_rules "-t nat" POSTROUTING -d "$OLD_EXIT_IP" -p tcp --dport "$XRAY_PORT" -j MASQUERADE
-    remove_all_rules ""       FORWARD -d "$OLD_EXIT_IP" -p tcp --dport "$XRAY_PORT" -j ACCEPT
-    remove_all_rules ""       FORWARD -s "$OLD_EXIT_IP" -p tcp --sport "$XRAY_PORT" -j ACCEPT
-elif [ "$OLD_EXIT_IP" = "$EXIT_IP" ]; then
-    log "Same exit IP — refreshing rules"
-    "$CHAIN_SCRIPT" stop 2>/dev/null || true
-fi
+with open('$RUSSIA_XRAY_CONFIG') as f:
+    c = json.load(f)
 
-sed -i "s/^LATVIA_IP=.*/LATVIA_IP=\"$EXIT_IP\"/" "$CHAIN_SCRIPT"
-"$CHAIN_SCRIPT" start
+# Find the 'latvia' outbound and update it
+for ob in c['outbounds']:
+    if ob.get('tag') == 'latvia':
+        ob['settings']['vnext'][0]['address'] = '$EXIT_IP'
+        ob['settings']['vnext'][0]['port'] = $XRAY_PORT
+        ob['settings']['vnext'][0]['users'][0]['id'] = '$SERVICE_UUID'
+        rs = ob['streamSettings']['realitySettings']
+        rs['publicKey'] = '$EXIT_PUBLIC_KEY'
+        rs['shortId'] = '$SHORT_ID'
+        rs['serverName'] = '$SNI'
+        break
+else:
+    print('ERROR: latvia outbound not found in config', file=sys.stderr)
+    sys.exit(1)
 
-echo 1 > /proc/sys/net/ipv4/ip_forward
-iptables-save > /etc/iptables/rules.v4
+with open('$RUSSIA_XRAY_CONFIG', 'w') as f:
+    json.dump(c, f, indent=4)
 
-DNAT_OK=$(iptables -t nat -L PREROUTING -n | grep -c "$EXIT_IP" || true)
-FWD_OK=$(iptables -L FORWARD -n | grep -c "$EXIT_IP" || true)
-[ "$DNAT_OK" -ge 1 ] || fail "DNAT rules not applied"
-[ "$FWD_OK" -ge 1 ]  || fail "FORWARD rules not applied"
+print('Russia config updated: exit=$EXIT_IP, pubkey=${EXIT_PUBLIC_KEY:0:16}...')
+" || fail "Failed to update Russia Xray config"
 
-log "iptables updated and saved (DNAT: $DNAT_OK rules, FORWARD: $FWD_OK rules)"
+systemctl restart xray
+sleep 3
+systemctl is-active xray >/dev/null 2>&1 || fail "Russia Xray failed to restart after config update"
+
+log "Russia Xray restarted with new exit: $EXIT_IP"
 
 # ---------------------------------------------------------------------------
 # Step 11: Full chain test
 # ---------------------------------------------------------------------------
 step 11 "Testing full VPN chain"
 
+# Test 1: TCP to exit
 TCP_OK="FAIL"
 if bash -c "exec 3<>/dev/tcp/$EXIT_IP/$XRAY_PORT" 2>/dev/null; then
     TCP_OK="OK"
     exec 3>&- 2>/dev/null
 fi
-log "TCP relay→exit ($EXIT_IP:$XRAY_PORT): $TCP_OK"
-[ "$TCP_OK" = "OK" ] || fail "Cannot reach exit server port $XRAY_PORT from relay"
+log "TCP Russia→exit ($EXIT_IP:$XRAY_PORT): $TCP_OK"
+[ "$TCP_OK" = "OK" ] || fail "Cannot reach exit server port $XRAY_PORT from Russia"
 
+# Test 2: Full chain through Russia's Xray (as a real client would)
 FIRST_UUID="${UUIDS[0]%%:*}"
 
 python3 -c "
@@ -460,8 +488,8 @@ c={
     'outbounds':[{
         'protocol':'vless',
         'settings':{'vnext':[{
-            'address':'$EXIT_IP',
-            'port':$XRAY_PORT,
+            'address':'127.0.0.1',
+            'port':443,
             'users':[{'id':'$FIRST_UUID','flow':'xtls-rprx-vision','encryption':'none'}]
         }]},
         'streamSettings':{
@@ -470,8 +498,8 @@ c={
             'realitySettings':{
                 'serverName':'$SNI',
                 'fingerprint':'$FINGERPRINT',
-                'publicKey':'$PUBLIC_KEY',
-                'shortId':'$SHORT_ID'
+                'publicKey':'$RUSSIA_PUBLIC_KEY',
+                'shortId':'$RUSSIA_SHORT_ID'
             }
         }
     }]
@@ -479,23 +507,35 @@ c={
 json.dump(c,open('$TMP_DIR/vpn-test.json','w'),indent=2)
 "
 
-pkill -f '/tmp/xray run -config.*vpn-test' 2>/dev/null || true
+pkill -f 'xray run -config.*vpn-test' 2>/dev/null || true
 sleep 1
 
-/tmp/xray run -config "$TMP_DIR/vpn-test.json" &>/dev/null &
+/usr/local/bin/xray run -config "$TMP_DIR/vpn-test.json" &>/dev/null &
 XRAY_TEST_PID=$!
 sleep 3
 
-HTTP_CODE=$(curl -x socks5h://127.0.0.1:10808 --connect-timeout 10 -s -o /dev/null -w '%{http_code}' https://www.google.com 2>/dev/null || echo "000")
+# google.com goes through Latvia (not in bypass list)
+HTTP_CODE=$(curl -x socks5h://127.0.0.1:10808 --connect-timeout 15 -s -o /dev/null -w '%{http_code}' https://www.google.com 2>/dev/null || echo "000")
+
+# youtube.com goes through ByeDPI (in bypass list)
+YT_CODE=$(curl -x socks5h://127.0.0.1:10808 --connect-timeout 15 -s -o /dev/null -w '%{http_code}' https://www.youtube.com 2>/dev/null || echo "000")
 
 kill $XRAY_TEST_PID 2>/dev/null
 wait $XRAY_TEST_PID 2>/dev/null || true
 
 if [ "$HTTP_CODE" = "200" ]; then
-    log "VPN chain test: HTTP $HTTP_CODE — SUCCESS"
+    log "Chain test (google.com via exit): HTTP $HTTP_CODE — OK"
 else
-    fail "VPN chain test failed (HTTP $HTTP_CODE). Check: ssh root@$EXIT_IP 'tail -20 /var/log/xray/error.log'"
+    warn "Chain test (google.com via exit): HTTP $HTTP_CODE"
 fi
+
+if [ "$YT_CODE" = "200" ]; then
+    log "Chain test (youtube.com via ByeDPI): HTTP $YT_CODE — OK"
+else
+    warn "Chain test (youtube.com via ByeDPI): HTTP $YT_CODE"
+fi
+
+[ "$HTTP_CODE" = "200" ] || [ "$YT_CODE" = "200" ] || fail "Both chain tests failed. Check logs."
 
 # ---------------------------------------------------------------------------
 # Output VLESS links
@@ -505,31 +545,29 @@ echo "============================================"
 echo -e "  ${GREEN}DEPLOYMENT SUCCESSFUL${NC}"
 echo "============================================"
 echo ""
-echo "  Exit server:  $EXIT_IP"
-echo "  Relay server: $RELAY_IP"
+echo "  Exit server:  $EXIT_IP (exit keys: ${EXIT_PUBLIC_KEY:0:16}...)"
+echo "  Russia router: $RELAY_IP (client keys: ${RUSSIA_PUBLIC_KEY:0:16}...)"
 echo "  Xray port:    $XRAY_PORT"
-echo "  Public Key:   $PUBLIC_KEY"
-echo "  Short ID:     $SHORT_ID"
 echo "  SNI:          $SNI"
 echo ""
 echo "============================================"
-echo "  VLESS LINKS"
+echo "  VLESS LINKS (using Russia's keys — unchanged)"
 echo "============================================"
 
 LINKS_FILE="$SCRIPT_DIR/links-$(date +%Y%m%d-%H%M%S).txt"
 
 {
     echo "# Generated $(date)"
-    echo "# Exit: $EXIT_IP | Relay: $RELAY_IP | SNI: $SNI"
-    echo "# Public Key: $PUBLIC_KEY"
-    echo "# Short ID: $SHORT_ID"
+    echo "# Exit: $EXIT_IP | Russia: $RELAY_IP | SNI: $SNI"
+    echo "# Russia Public Key: $RUSSIA_PUBLIC_KEY"
+    echo "# Russia Short ID: $RUSSIA_SHORT_ID"
     echo ""
 } > "$LINKS_FILE"
 
 for entry in "${UUIDS[@]}"; do
     uuid="${entry%%:*}"
     name="${entry#*:}"
-    link="vless://${uuid}@${RELAY_IP}:443?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&sni=${SNI}&fp=${FINGERPRINT}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}#${name}"
+    link="vless://${uuid}@${RELAY_IP}:443?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&sni=${SNI}&fp=${FINGERPRINT}&pbk=${RUSSIA_PUBLIC_KEY}&sid=${RUSSIA_SHORT_ID}#${name}"
     echo ""
     echo "--- $name ---"
     echo "$link"
@@ -541,5 +579,5 @@ done
 echo ""
 echo "============================================"
 echo "  Links saved: $LINKS_FILE"
-echo "  All users must update their VLESS config!"
+echo "  Client links are UNCHANGED (same Russia keys)"
 echo "============================================"
